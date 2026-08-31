@@ -1,0 +1,15 @@
+# Secrets and per-host state — never commit these
+token
+config.json
+ego-bridge.conf
+uploads/
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+._*

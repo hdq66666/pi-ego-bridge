@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent template for ego-bridge.
+
+  Install:
+    sed -e "s|__PYTHON__|$(command -v python3)|" \
+        -e "s|__SCRIPT__|$HOME/pi-ego-bridge/mac/ego-bridge.py|" \
+        -e "s|__DIR__|$HOME/pi-ego-bridge/mac|" \
+        mac/io.github.hdq66666.ego-bridge.plist.example \
+        > ~/Library/LaunchAgents/io.github.hdq66666.ego-bridge.plist
+    launchctl load  ~/Library/LaunchAgents/io.github.hdq66666.ego-bridge.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/io.github.hdq66666.ego-bridge.plist
+
+  It must be a LaunchAgent (per-user), not a LaunchDaemon: ego-browser talks to
+  the ego lite app running in the user's GUI session.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.hdq66666.ego-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__SCRIPT__</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__DIR__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__DIR__/logs/bridge.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__DIR__/logs/bridge.log</string>
+</dict>
+</plist>

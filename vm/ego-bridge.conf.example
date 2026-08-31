@@ -1,0 +1,9 @@
+# /etc/ego-bridge.conf  — read by the ego-browser shim. chmod 600.
+# Environment variables of the same name take precedence over this file.
+
+# Where the bridge is listening, on the Mac that runs ego lite.
+# A .local mDNS name survives DHCP lease changes better than a bare IP.
+EGO_BRIDGE_URL=http://192.168.1.10:8791
+
+# Must match the contents of the bridge's `token` file on the Mac.
+EGO_BRIDGE_TOKEN=replace-me

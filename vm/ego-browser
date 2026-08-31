@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Drop-in `ego-browser` for hosts without ego lite.
+
+Installed on the VM as /usr/local/bin/ego-browser so the stock ego-browser
+skill works unchanged: the agent still writes
+
+    ego-browser nodejs <<'EOF' ... EOF
+
+but the script is forwarded to the ego-bridge running on the macOS host, run
+there against the real ego lite browser, and the results are streamed back.
+Screenshot files produced on the Mac are downloaded to this host and the paths
+in the output are rewritten so the agent can open them locally.
+
+Config: /etc/ego-bridge.conf  (KEY=VALUE)
+    EGO_BRIDGE_URL=http://<mac-ip>:8791
+    EGO_BRIDGE_TOKEN=...
+Environment variables of the same name take precedence.
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONF_PATH = os.environ.get("EGO_BRIDGE_CONF", "/etc/ego-bridge.conf")
+FILE_DIR = os.environ.get("EGO_BRIDGE_FILE_DIR", "/var/tmp/ego-bridge/files")
+HTTP_TIMEOUT = float(os.environ.get("EGO_BRIDGE_HTTP_TIMEOUT", "620"))
+RUN_TIMEOUT = float(os.environ.get("EGO_BRIDGE_RUN_TIMEOUT", "600"))
+
+
+def load_conf():
+    conf = {}
+    try:
+        with open(CONF_PATH) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                conf[k.strip()] = v.strip()
+    except IOError:
+        pass
+    for k in ("EGO_BRIDGE_URL", "EGO_BRIDGE_TOKEN"):
+        if os.environ.get(k):
+            conf[k] = os.environ[k]
+    return conf
+
+
+def die(msg, code=127):
+    sys.stderr.write("ego-browser (bridge shim): %s\n" % msg)
+    sys.exit(code)
+
+
+def request(url, token, data=None, ctype="application/json"):
+    req = urllib.request.Request(url, data=data)
+    req.add_header("Authorization", "Bearer " + token)
+    if data is not None:
+        req.add_header("Content-Type", ctype)
+    return urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+
+
+def fetch_artifacts(base, token, artifacts):
+    """Download Mac-side files here; return {mac_path: local_path}."""
+    mapping = {}
+    if not artifacts:
+        return mapping
+    try:
+        os.makedirs(FILE_DIR)
+    except OSError:
+        pass
+    for art in artifacts:
+        mac_path = art.get("path")
+        if not mac_path:
+            continue
+        local = os.path.join(FILE_DIR, os.path.basename(mac_path))
+        url = base + "/file?" + urllib.parse.urlencode({"path": mac_path})
+        try:
+            with request(url, token) as resp:
+                blob = resp.read()
+            with open(local, "wb") as fh:
+                fh.write(blob)
+            mapping[mac_path] = local
+        except Exception as exc:  # a missing screenshot must not fail the run
+            sys.stderr.write(
+                "ego-browser (bridge shim): could not fetch %s: %s\n" % (mac_path, exc)
+            )
+    return mapping
+
+
+def main():
+    conf = load_conf()
+    base = (conf.get("EGO_BRIDGE_URL") or "").rstrip("/")
+    token = conf.get("EGO_BRIDGE_TOKEN") or ""
+    if not base or not token:
+        die("EGO_BRIDGE_URL / EGO_BRIDGE_TOKEN missing (looked in %s)" % CONF_PATH)
+
+    args = sys.argv[1:]
+    script = "" if sys.stdin.isatty() else sys.stdin.read()
+
+    payload = json.dumps({"args": args, "stdin": script, "timeout": RUN_TIMEOUT}).encode()
+    try:
+        with request(base + "/run", token, payload) as resp:
+            result = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:500]
+        die("bridge rejected the request (HTTP %s): %s" % (exc.code, detail))
+    except urllib.error.URLError as exc:
+        die(
+            "cannot reach the ego-bridge at %s (%s).\n"
+            "Check that the macOS host is awake and the bridge is running." % (base, exc.reason)
+        )
+
+    out = result.get("stdout") or ""
+    err = result.get("stderr") or ""
+    mapping = fetch_artifacts(base, token, result.get("artifacts") or [])
+    for mac_path, local in mapping.items():
+        out = out.replace(mac_path, local)
+        err = err.replace(mac_path, local)
+
+    sys.stdout.write(out)
+    sys.stdout.flush()
+    sys.stderr.write(err)
+    sys.stderr.flush()
+    sys.exit(int(result.get("code") or 0))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+{
+  "host": "0.0.0.0",
+  "port": 8791,
+
+  "//allow_ips": "Source IPs allowed to reach the bridge. CIDR is accepted. Keep this as tight as possible — anything listed here can execute JavaScript on this Mac.",
+  "allow_ips": ["127.0.0.1", "::1", "192.168.1.50"],
+
+  "//ego_browser": "Absolute path to the real ego-browser binary. Defaults to ~/.local/bin/ego-browser.",
+  "ego_browser": "/Users/you/.local/bin/ego-browser",
+
+  "//timeout": "Seconds a single ego-browser run may take before the bridge gives up.",
+  "timeout": 300,
+
+  "max_parallel": 4,
+
+  "//allowed_subcommands": "Subcommands the bridge will pass through. Leave import/upgrade out: profile import and app upgrade are the Mac user's job.",
+  "allowed_subcommands": ["nodejs", "help", "--help", "-h", "--version", "-v"]
+}
