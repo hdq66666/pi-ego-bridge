@@ -48,9 +48,13 @@ about the remote hop before it reads anything else:
 > browser running on the macOS host on the LAN. Usage below is unchanged: same
 > `ego-browser nodejs <<'EOF'` heredoc, same helpers, same task spaces.
 > `captureScreenshot()` paths are rewritten to local files under
-> `/var/tmp/ego-bridge/files/`, so you can read them directly. If a command fails
-> to connect, read `references/install.md`; never run `scripts/install.sh` (macOS
-> only). The browser belongs to a real user — respect the handoff rules below.
+> `/var/tmp/ego-bridge/files/`, and anything the browser downloads is copied to
+> `/var/tmp/ego-bridge/downloads/` and listed after the run — so you can read
+> both directly. If a download is the last thing you do, end with `await wait(3)`
+> or run one more round, or it may only be reported on your next call. If a
+> command fails to connect, read `references/install.md`; never run
+> `scripts/install.sh` (macOS only). The browser belongs to a real user — respect
+> the handoff rules below.
 ```
 
 Everything else in `SKILL.md` stays exactly as shipped.

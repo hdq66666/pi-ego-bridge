@@ -59,7 +59,7 @@ through a shell.
 └────────────────────────────┘               └──────────────────────────────┘
 ```
 
-Three details that make it transparent rather than merely functional:
+Four details that make it transparent rather than merely functional:
 
 1. **`cliLog` writes to stderr, not stdout.** Running the CLI in a terminal
    merges the two, so it is easy to miss. The shim keeps the streams separate and
@@ -69,7 +69,15 @@ Three details that make it transparent rather than merely functional:
    allowlisted root, reports them as `artifacts`, and the shim downloads each one
    to `/var/tmp/ego-bridge/files/` and rewrites the path in the output. The agent
    reads the PNG with its normal file tools and never learns there was a hop.
-3. **Uploads go the other way.** `uploadFile()` needs a path on the Mac, so the
+3. **Downloads follow the agent too.** Anything the browser saves on the Mac
+   during a run is copied to `/var/tmp/ego-bridge/downloads/` on the agent host,
+   and the shim prints what arrived. The click that starts a download returns
+   long before Chromium finishes writing the file — measured at ~3s for a small
+   one — so the bridge waits a short, interruptible grace period, then waits out
+   any `.crdownload` so half a file is never reported as whole. A download that
+   still lands too late is picked up by the next call: the bridge keeps a
+   watermark, so files are delayed, never dropped.
+4. **Uploads go the other way.** `uploadFile()` needs a path on the Mac, so the
    bridge accepts `POST /upload` and answers with the Mac-side path to pass in.
 
 ## Requirements
@@ -162,7 +170,7 @@ Every endpoint requires `Authorization: Bearer <token>` **and** a source IP in
 | Method | Path | Body / query | Returns |
 |---|---|---|---|
 | `GET` | `/health` | — | `{"ok": true, "ego_browser": "<path>"}` |
-| `POST` | `/run` | `{"args": ["nodejs"], "stdin": "<script>", "timeout": 600}` | `{"code", "stdout", "stderr", "artifacts": [{"path", "size"}]}` |
+| `POST` | `/run` | `{"args": ["nodejs"], "stdin": "<script>", "timeout": 600}` | `{"code", "stdout", "stderr", "artifacts": [...], "downloads": [...]}` |
 | `GET` | `/file` | `?path=<mac path>` | raw bytes; only inside allowlisted roots |
 | `POST` | `/upload` | raw body, `?name=<filename>` | `{"path": "<mac path>"}` |
 
@@ -179,6 +187,18 @@ Every endpoint requires `Authorization: Bearer <token>` **and** a source IP in
 | `timeout` | `300` | Seconds per run |
 | `max_parallel` | `4` | Concurrent runs |
 | `allowed_subcommands` | `nodejs`, `help`, `--help`, `-h`, `--version`, `-v` | Everything else is refused |
+| `watch_dirs` | `["~/Downloads"]` | Where browser downloads are picked up |
+| `download_grace` | `4` | Seconds to wait for a download to appear (see below) |
+| `download_settle` | `20` | Extra seconds to wait out a `.crdownload` |
+| `max_download_bytes` | `104857600` | Larger files are reported, not shipped |
+
+**About `download_grace`.** It is the one knob with a real cost: a call that
+downloads nothing still waits this long. Measured on a LAN, an `ego-browser`
+round trip that does trivial work takes ~270 ms; with the default 4 s grace it
+takes ~4.3 s. The wait is interruptible, so a call that *does* download exits as
+soon as the file lands. Set it to `0` for zero overhead — downloads then arrive
+with the *next* call instead of the current one, which is usually fine because
+agents rarely stop right after a download.
 
 **Agent host — `/etc/ego-bridge.conf`**, overridable by the environment:
 `EGO_BRIDGE_URL`, `EGO_BRIDGE_TOKEN`, plus `EGO_BRIDGE_CONF`,
@@ -210,6 +230,14 @@ What it does **not** do:
   crosses anything less trusted.
 - **No sandbox** around the executed script. The agent's own guardrails are the
   only limit on what it does in your browser.
+- **No separation between your downloads and the agent's.** `watch_dirs`
+  defaults to `~/Downloads`, which is where *your* browsing saves files too, and
+  ego lite offers no way to give the agent its own download folder. Anything
+  landing there while the agent works is copied to the agent host — including a
+  file you downloaded yourself. Only files touched after the bridge starts are
+  considered, so your existing Downloads folder is never swept up. If that is
+  not tight enough, change ego lite's download folder in the browser's own
+  settings and point `watch_dirs` at it.
 
 Do not expose port 8791 to the internet, and do not port-forward it.
 
@@ -220,6 +248,9 @@ Do not expose port 8791 to the internet, and do not port-forward it.
   `EGO_BRIDGE_URL` is steadier.
 - `uploadFile()` needs the two-step upload described above — it is documented in
   `skill/install.md` so the agent finds it on its own.
+- A screenshot path rewritten for the agent host is **not** valid back on the
+  Mac, so it cannot be handed straight to `uploadFile()`; push it with
+  `/upload` first.
 - One bridge serves one Mac user session. Multiple agents can share it (see
   `max_parallel`); ego lite's task spaces keep their tabs apart.
 
@@ -229,10 +260,18 @@ ego lite 是 macOS 应用，`ego-browser` 是 arm64 原生二进制、只能通�
 通信，所以跑在 Linux 虚拟机上的 agent 完全用不了这个 skill。
 
 本项目在 agent 主机上放一个**同名 shim**：agent 照常写 `ego-browser nodejs <<'EOF'`，
-脚本被转发到 Mac 上的桥接服务执行，stdout/stderr/退出码原样返回。三个关键点：
+脚本被转发到 Mac 上的桥接服务执行，stdout/stderr/退出码原样返回。四个关键点：
 `cliLog` 走 stderr 所以两条流必须分开；截图返回的是 Mac 本地路径，桥会把文件回传到
-`/var/tmp/ego-bridge/files/` 并改写路径，agent 直接就能读；`uploadFile()` 需要 Mac
-上的路径，所以提供了反向的 `POST /upload`。
+`/var/tmp/ego-bridge/files/` 并改写路径，agent 直接就能读；浏览器下载的文件同样会同步到
+`/var/tmp/ego-bridge/downloads/`（点击返回时文件往往还没落盘，实测慢约 3 秒，所以桥会
+等一个可中断的宽限期，再等 `.crdownload` 写完；万一还是没赶上，watermark 保证它在下一次
+调用时被捞回来，只会延迟不会丢）；`uploadFile()` 需要 Mac 上的路径，所以提供了反向的
+`POST /upload`。
+
+注意 `download_grace` 有代价：没有下载的调用也要等满这个时间（默认 4 秒，实测空跑
+270ms → 4.3s）。设成 `0` 可以零开销，代价是下载改为在下一次调用时到达。另外下载目录默认
+就是 `~/Downloads`，和你自己的下载混在一起——agent 工作期间你自己下的文件也会被同步过去，
+介意的话在 ego lite 设置里改下载目录，再把 `watch_dirs` 指过去。
 
 安全上用 bearer token + 源 IP 白名单 + 子命令白名单防护，但请认清本质：拿到 token
 就等于能在你的 Mac 上执行任意 JS。**只在可信局域网内使用，不要做端口映射。**

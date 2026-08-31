@@ -20,6 +20,13 @@ the browser app on this Linux host.
 - **Screenshots**: `await captureScreenshot()` returns a path that has already
   been rewritten to a local file under `/var/tmp/ego-bridge/files/`. The PNG is
   downloaded here automatically, so read it with your normal file tools.
+- **Downloads**: files the browser saves on the Mac are copied here
+  automatically, into `/var/tmp/ego-bridge/downloads/`. When a run produces one,
+  the shim prints a line listing what arrived — open those paths with your normal
+  file tools. A download that lands too late to be caught is reported at the
+  start of the *next* `ego-browser` call, never dropped. So if a download is the
+  last thing you do, end the script with `await wait(3)` or run one more small
+  round, otherwise you may not see it mentioned.
 - **`uploadFile(path)`**: the path must exist *on the Mac*, not here. Push the
   file first:
 

@@ -4,7 +4,7 @@
 The pi agent on the VM runs a shim also named `ego-browser`; the shim forwards
 `ego-browser nodejs <script>` here, this process runs the real macOS binary
 against the running ego lite app, and returns stdout/stderr/exit code plus any
-screenshot files the script produced.
+screenshot files the script produced and any files the browser downloaded.
 
 Security: a request that reaches /run executes arbitrary JavaScript in ego
 lite's Node runtime on this Mac. Access is gated by a bearer token AND a source
@@ -16,6 +16,8 @@ import json
 import os
 import re
 import shlex
+import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -38,6 +40,19 @@ DEFAULTS = {
     "timeout": 300,
     "max_parallel": 4,
     "allowed_subcommands": ["nodejs", "help", "--help", "-h", "--version", "-v"],
+    # Directories watched for browser downloads. Empty means ~/Downloads,
+    # which is where ego lite saves unless the user changed it in the browser.
+    "watch_dirs": [],
+    # Seconds to keep waiting after a script ends for a download to *appear*.
+    # A click returns long before Chromium writes the file (measured ~3s for a
+    # small one), so without this the file is only reported on the next call.
+    # Interruptible: as soon as something shows up the wait ends. Set 0 to skip.
+    "download_grace": 4,
+    # Seconds to keep waiting once a partial download (.crdownload) is being
+    # written, so half a file is never reported as complete.
+    "download_settle": 20,
+    # Files larger than this are reported but not shipped automatically.
+    "max_download_bytes": 100 * 1024 * 1024,
 }
 
 
@@ -56,15 +71,27 @@ with open(TOKEN_PATH) as fh:
 ALLOW_NETS = [ipaddress.ip_network(a, strict=False) for a in CFG["allow_ips"]]
 SLOTS = threading.Semaphore(CFG["max_parallel"])
 
-# Files the bridge is willing to hand back to the VM. Screenshots land in the
-# per-user temp dir; uploads pushed from the VM get their own tree.
+WATCH_DIRS = [
+    os.path.realpath(os.path.expanduser(p))
+    for p in (CFG["watch_dirs"] or [os.path.join(HOME, "Downloads")])
+]
+PARTIAL_SUFFIXES = (".crdownload", ".part", ".download", ".tmp", ".partial")
+
+# Files the bridge is willing to hand back to the agent host. Screenshots land
+# in the per-user temp dir; downloads in the watched dirs; uploads pushed from
+# the agent host get their own tree.
 UPLOAD_DIR = os.path.join(BASE, "uploads")
 _tmp = os.path.realpath(os.environ.get("TMPDIR", "/tmp"))
 FILE_ROOTS = [
     os.path.realpath(p)
-    for p in {_tmp, "/tmp", "/private/tmp", os.path.join(HOME, "Downloads"), UPLOAD_DIR}
+    for p in set([_tmp, "/tmp", "/private/tmp", UPLOAD_DIR] + WATCH_DIRS)
 ]
 ARTIFACT_RE = re.compile(r"(/[^\s\"'`,;:()\[\]<>]+\.(?:png|jpe?g|webp|gif|pdf))")
+
+# Only files touched after this point are treated as the agent's downloads, so
+# a fresh bridge never sweeps up the user's existing Downloads folder.
+_watermark_lock = threading.Lock()
+_watermark = time.time()
 
 
 def log(msg):
@@ -92,8 +119,78 @@ def find_artifacts(text):
     return out
 
 
+def scan_downloads(since):
+    """Regular files in the watched dirs touched after `since`.
+
+    Returns (files, partial_in_progress). Directories and dotfiles are skipped;
+    a still-downloading `.crdownload` counts only as "wait a bit longer".
+    """
+    files = []
+    partial = False
+    for directory in WATCH_DIRS:
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
+            if name.startswith("."):
+                continue
+            path = os.path.join(directory, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_mtime <= since:
+                continue
+            if name.endswith(PARTIAL_SUFFIXES):
+                partial = True
+                continue
+            files.append(
+                {
+                    "path": path,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "too_large": st.st_size > CFG["max_download_bytes"],
+                }
+            )
+    return files, partial
+
+
+def collect_downloads():
+    """Downloads that appeared since the last time we reported any.
+
+    Waits out an in-flight download rather than reporting half a file. The
+    watermark is taken *before* the scan so a file written during the scan is
+    picked up by the next run instead of being lost.
+    """
+    global _watermark
+    with _watermark_lock:
+        since = _watermark
+    now = time.time()
+    grace_until = now + float(CFG["download_grace"])
+    settle_until = now + float(CFG["download_settle"])
+    while True:
+        scan_ts = time.time()
+        files, partial = scan_downloads(since)
+        if partial:
+            # Something is mid-write. Wait for it rather than ship half a file.
+            if scan_ts >= settle_until:
+                break
+            time.sleep(0.5)
+            continue
+        if files or scan_ts >= grace_until:
+            break
+        time.sleep(0.25)
+    with _watermark_lock:
+        if scan_ts > _watermark:
+            _watermark = scan_ts
+    if files:
+        log("downloads: %s" % ", ".join(os.path.basename(f["path"]) for f in files))
+    return files
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ego-bridge/1.0"
+    server_version = "ego-bridge/1.1"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -110,6 +207,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_file(self, path):
+        size = os.path.getsize(path)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        with open(path, "rb") as fh:
+            shutil.copyfileobj(fh, self.wfile, 1024 * 1024)
 
     def _authorized(self):
         ip = ipaddress.ip_address(self.client_address[0])
@@ -133,7 +239,14 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/health":
             if not self._authorized():
                 return
-            return self._send(200, {"ok": True, "ego_browser": CFG["ego_browser"]})
+            return self._send(
+                200,
+                {
+                    "ok": True,
+                    "ego_browser": CFG["ego_browser"],
+                    "watch_dirs": WATCH_DIRS,
+                },
+            )
         if url.path == "/file":
             if not self._authorized():
                 return
@@ -142,9 +255,7 @@ class Handler(BaseHTTPRequestHandler):
             rp = path_allowed(raw)
             if not rp or not os.path.isfile(rp):
                 return self._send(404, {"error": "no such readable file: %s" % raw})
-            with open(rp, "rb") as fh:
-                data = fh.read()
-            return self._send(200, data, "application/octet-stream")
+            return self._send_file(rp)
         self._send(404, {"error": "unknown path"})
 
     def do_POST(self):
@@ -203,6 +314,7 @@ class Handler(BaseHTTPRequestHandler):
                 "stdout": out_s,
                 "stderr": err_s,
                 "artifacts": find_artifacts(out_s + "\n" + err_s),
+                "downloads": collect_downloads() if head[0] == "nodejs" else [],
             },
         )
 
@@ -211,6 +323,7 @@ def main():
     srv = ThreadingHTTPServer((CFG["host"], CFG["port"]), Handler)
     srv.daemon_threads = True
     log("ego-bridge listening on %s:%s, allow=%s" % (CFG["host"], CFG["port"], CFG["allow_ips"]))
+    log("watching for downloads in: %s" % ", ".join(WATCH_DIRS))
     srv.serve_forever()
 
 

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Drop-in `ego-browser` for hosts without ego lite.
 
-Installed on the VM as /usr/local/bin/ego-browser so the stock ego-browser
-skill works unchanged: the agent still writes
+Installed on the agent host as /usr/local/bin/ego-browser so the stock
+ego-browser skill works unchanged: the agent still writes
 
     ego-browser nodejs <<'EOF' ... EOF
 
 but the script is forwarded to the ego-bridge running on the macOS host, run
 there against the real ego lite browser, and the results are streamed back.
-Screenshot files produced on the Mac are downloaded to this host and the paths
-in the output are rewritten so the agent can open them locally.
+Screenshots taken on the Mac and files the browser downloads are copied to this
+host, with the paths in the output rewritten so the agent can open them locally.
 
 Config: /etc/ego-bridge.conf  (KEY=VALUE)
     EGO_BRIDGE_URL=http://<mac-ip>:8791
@@ -25,6 +25,7 @@ import urllib.request
 
 CONF_PATH = os.environ.get("EGO_BRIDGE_CONF", "/etc/ego-bridge.conf")
 FILE_DIR = os.environ.get("EGO_BRIDGE_FILE_DIR", "/var/tmp/ego-bridge/files")
+DOWNLOAD_DIR = os.environ.get("EGO_BRIDGE_DOWNLOAD_DIR", "/var/tmp/ego-bridge/downloads")
 HTTP_TIMEOUT = float(os.environ.get("EGO_BRIDGE_HTTP_TIMEOUT", "620"))
 RUN_TIMEOUT = float(os.environ.get("EGO_BRIDGE_RUN_TIMEOUT", "600"))
 
@@ -52,6 +53,17 @@ def die(msg, code=127):
     sys.exit(code)
 
 
+def note(msg):
+    sys.stderr.write("ego-browser (bridge shim): %s\n" % msg)
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return "%.0f %s" % (n, unit) if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1024.0
+
+
 def request(url, token, data=None, ctype="application/json"):
     req = urllib.request.Request(url, data=data)
     req.add_header("Authorization", "Bearer " + token)
@@ -60,32 +72,29 @@ def request(url, token, data=None, ctype="application/json"):
     return urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
 
 
-def fetch_artifacts(base, token, artifacts):
-    """Download Mac-side files here; return {mac_path: local_path}."""
-    mapping = {}
-    if not artifacts:
-        return mapping
+def pull(base, token, mac_path, dest_dir, expected_size=None):
+    """Copy one Mac-side file here. Returns the local path, or None."""
     try:
-        os.makedirs(FILE_DIR)
+        os.makedirs(dest_dir)
     except OSError:
         pass
-    for art in artifacts:
-        mac_path = art.get("path")
-        if not mac_path:
-            continue
-        local = os.path.join(FILE_DIR, os.path.basename(mac_path))
-        url = base + "/file?" + urllib.parse.urlencode({"path": mac_path})
+    local = os.path.join(dest_dir, os.path.basename(mac_path))
+    if expected_size is not None:
         try:
-            with request(url, token) as resp:
-                blob = resp.read()
-            with open(local, "wb") as fh:
-                fh.write(blob)
-            mapping[mac_path] = local
-        except Exception as exc:  # a missing screenshot must not fail the run
-            sys.stderr.write(
-                "ego-browser (bridge shim): could not fetch %s: %s\n" % (mac_path, exc)
-            )
-    return mapping
+            if os.path.getsize(local) == expected_size:
+                return local  # already have this exact file
+        except OSError:
+            pass
+    url = base + "/file?" + urllib.parse.urlencode({"path": mac_path})
+    try:
+        with request(url, token) as resp:
+            blob = resp.read()
+        with open(local, "wb") as fh:
+            fh.write(blob)
+        return local
+    except Exception as exc:  # a missing file must never fail the whole run
+        note("could not fetch %s: %s" % (mac_path, exc))
+        return None
 
 
 def main():
@@ -113,15 +122,40 @@ def main():
 
     out = result.get("stdout") or ""
     err = result.get("stderr") or ""
-    mapping = fetch_artifacts(base, token, result.get("artifacts") or [])
-    for mac_path, local in mapping.items():
-        out = out.replace(mac_path, local)
-        err = err.replace(mac_path, local)
+
+    # Screenshots and similar: rewrite the Mac path the script printed so the
+    # agent reads the copy that now lives here.
+    for art in result.get("artifacts") or []:
+        local = pull(base, token, art["path"], FILE_DIR, art.get("size"))
+        if local:
+            out = out.replace(art["path"], local)
+            err = err.replace(art["path"], local)
 
     sys.stdout.write(out)
     sys.stdout.flush()
     sys.stderr.write(err)
+
+    # Files the browser downloaded on the Mac. The agent never named these, so
+    # instead of rewriting paths, report them explicitly.
+    synced, oversized = [], []
+    for dl in result.get("downloads") or []:
+        if dl.get("too_large"):
+            oversized.append(dl)
+            continue
+        local = pull(base, token, dl["path"], DOWNLOAD_DIR, dl.get("size"))
+        if local:
+            synced.append((local, dl.get("size") or 0))
+    if synced:
+        note("%d file(s) downloaded by the browser are now available here:" % len(synced))
+        for local, size in synced:
+            sys.stderr.write("  %s  (%s)\n" % (local, human(size)))
+    for dl in oversized:
+        note(
+            "download too large to sync automatically: %s (%s). Fetch it with "
+            "GET /file?path=... if you need it." % (dl["path"], human(dl.get("size") or 0))
+        )
     sys.stderr.flush()
+
     sys.exit(int(result.get("code") or 0))
 
 
