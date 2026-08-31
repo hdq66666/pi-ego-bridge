@@ -320,6 +320,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # The bridge writes here; a fresh checkout (or a moved one) may not have it.
+    for d in (UPLOAD_DIR, os.path.join(BASE, "logs")):
+        try:
+            os.makedirs(d)
+        except OSError:
+            pass
     srv = ThreadingHTTPServer((CFG["host"], CFG["port"]), Handler)
     srv.daemon_threads = True
     log("ego-bridge listening on %s:%s, allow=%s" % (CFG["host"], CFG["port"], CFG["allow_ips"]))
