@@ -104,14 +104,36 @@ chmod 600 token
 # allow your agent host in
 cp config.example.json config.json
 $EDITOR config.json          # set allow_ips to your agent host's IP
-
-python3 ego-bridge.py        # foreground; see below for LaunchAgent
 ```
 
 `token`, `config.json`, `uploads/` and `logs/` are gitignored — they are
 per-host state, not source.
 
-To keep it running across logins, install the LaunchAgent template:
+### Running it
+
+In a terminal you keep open:
+
+```bash
+cd ~/pi-ego-bridge/mac && python3 ego-bridge.py
+```
+
+Or detached, so it outlives the terminal:
+
+```bash
+cd ~/pi-ego-bridge/mac && nohup python3 ego-bridge.py >> logs/bridge.log 2>&1 &
+```
+
+Stop it with `pkill -f ego-bridge.py`. Check on it with:
+
+```bash
+curl -s -H "Authorization: Bearer $(cat ~/pi-ego-bridge/mac/token)" http://127.0.0.1:8791/health
+```
+
+Either way it must run as the logged-in Mac user, in that user's GUI session —
+that is where ego lite lives. A `sudo` or root-owned process cannot reach it.
+
+<details>
+<summary>Optional: start it automatically at login</summary>
 
 ```bash
 sed -e "s|__PYTHON__|$(command -v python3)|" \
@@ -122,8 +144,11 @@ sed -e "s|__PYTHON__|$(command -v python3)|" \
 launchctl load ~/Library/LaunchAgents/io.github.hdq66666.ego-bridge.plist
 ```
 
-It has to be a LaunchAgent, not a LaunchDaemon — `ego-browser` needs the user's
-GUI session, where ego lite is running.
+It has to be a LaunchAgent, not a LaunchDaemon, for the same reason: a
+LaunchDaemon runs outside the user's GUI session and cannot talk to the browser.
+Unload it with `launchctl unload ~/Library/LaunchAgents/io.github.hdq66666.ego-bridge.plist`.
+
+</details>
 
 ## Install — agent host side
 
@@ -244,8 +269,9 @@ Do not expose port 8791 to the internet, and do not port-forward it.
 ## Limitations
 
 - The Mac must be **awake and logged in**, with ego lite running.
-- Bare IPs break on DHCP lease changes; a `.local` mDNS name in
-  `EGO_BRIDGE_URL` is steadier.
+- `EGO_BRIDGE_URL` pins the Mac by address. A static IP or a DHCP reservation
+  is all you need; without one, use the Mac's `.local` mDNS name so a new lease
+  does not silently break the link.
 - `uploadFile()` needs the two-step upload described above — it is documented in
   `skill/install.md` so the agent finds it on its own.
 - A screenshot path rewritten for the agent host is **not** valid back on the
